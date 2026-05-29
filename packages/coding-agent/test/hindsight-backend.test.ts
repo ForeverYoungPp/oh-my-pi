@@ -335,6 +335,42 @@ describe("hindsightBackend first-turn injection", () => {
 		expect(session.getHindsightSessionState()?.lastRecallSnippet).toBe(block);
 	});
 
+	it("returns the cached snippet on subsequent calls, not undefined", async () => {
+		const settings = Settings.isolated({
+			"memory.backend": "hindsight",
+			"hindsight.apiUrl": "http://localhost:8888",
+		});
+		const session = makeFakeSession({ sessionId: "s-stable" });
+		await hindsightBackend.start({
+			session: session as never,
+			settings,
+			modelRegistry: {} as never,
+			agentDir: "/tmp",
+			taskDepth: 0,
+		});
+
+		vi.spyOn(HindsightApi.prototype, "recall").mockResolvedValue({
+			results: [{ id: "1", text: "stable memory content" }],
+		} as never);
+
+		// First call: should return the recall snippet
+		const first = await hindsightBackend.beforeAgentStartPrompt?.(
+			session as never,
+			"first prompt",
+		);
+		expect(first).toContain("stable memory content");
+
+		// Second call: must return the SAME value, not undefined
+		const second = await hindsightBackend.beforeAgentStartPrompt?.(
+			session as never,
+			"second prompt",
+		);
+		expect(second).toBe(first);
+		expect(second).not.toBeUndefined();
+		expect(session.getHindsightSessionState()?.hasRecalledForFirstTurn).toBe(true);
+		expect(session.getHindsightSessionState()?.lastRecallSnippet).toBe(first);
+  });
+	
 	it("keeps the <memories> wrapper in buildDeveloperInstructions", async () => {
 		const settings = Settings.isolated({
 			"memory.backend": "hindsight",

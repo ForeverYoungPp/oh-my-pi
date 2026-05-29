@@ -354,9 +354,9 @@ export class HindsightSessionState {
 		const { context, ok } = await this.recallForContext(truncated);
 		if (!ok) return;
 
-		this.hasRecalledForFirstTurn = true;
 		if (!context) return;
 
+		this.hasRecalledForFirstTurn = true;
 		this.lastRecallSnippet = context;
 		await this.#refreshBaseSystemPromptAfter("recall");
 	}
@@ -366,7 +366,8 @@ export class HindsightSessionState {
 			await Promise.race([this.mentalModelsLoadPromise, Bun.sleep(MENTAL_MODEL_FIRST_TURN_DEADLINE_MS)]);
 		}
 
-		if (!this.config.autoRecall || this.hasRecalledForFirstTurn) return undefined;
+		if (!this.config.autoRecall) return undefined;
+		if (this.hasRecalledForFirstTurn) return this.lastRecallSnippet;
 
 		const latestPrompt = promptText.trim();
 		if (!latestPrompt) return undefined;
@@ -378,9 +379,9 @@ export class HindsightSessionState {
 		const { context, ok } = await this.recallForContext(truncated);
 		if (!ok) return undefined;
 
-		this.hasRecalledForFirstTurn = true;
 		if (!context) return undefined;
 
+		this.hasRecalledForFirstTurn = true;
 		this.lastRecallSnippet = context;
 		return context;
 	}
