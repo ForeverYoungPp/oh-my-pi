@@ -255,20 +255,23 @@ export class ModelSelectorComponent extends Container {
 	}
 
 	#buildMenuRoleActions(): void {
-		this.#menuRoleActions = getKnownRoleIds(this.#settings).map(role => {
-			const roleInfo = getRoleInfo(role, this.#settings);
-			const roleLabel = roleInfo.tag ? `${roleInfo.tag} (${roleInfo.name})` : roleInfo.name;
-			return {
-				label: `Set as ${roleLabel}`,
-				role,
-			};
-		});
+		this.#menuRoleActions = getKnownRoleIds(this.#settings)
+			.filter(role => role !== "route" || this.#settings.get("autoRouting"))
+			.map(role => {
+				const roleInfo = getRoleInfo(role, this.#settings);
+				const roleLabel = roleInfo.tag ? `${roleInfo.tag} (${roleInfo.name})` : roleInfo.name;
+				return {
+					label: `Set as ${roleLabel}`,
+					role,
+				};
+			});
 	}
 
 	#loadRoleModels(): void {
 		const allModels = this.#modelRegistry.getAll();
 		const matchPreferences = { usageOrder: this.#settings.getStorage()?.getModelUsageOrder() };
 		for (const role of getKnownRoleIds(this.#settings)) {
+			if (role === "route" && !this.#settings.get("autoRouting")) continue;
 			const roleValue = this.#settings.getModelRole(role);
 			if (!roleValue) continue;
 

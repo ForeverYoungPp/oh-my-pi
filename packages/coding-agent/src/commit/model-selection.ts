@@ -29,7 +29,12 @@ export async function resolvePrimaryModel(
 	const matchPreferences = { usageOrder: settings.getStorage()?.getModelUsageOrder() };
 	const resolved = override
 		? resolveModelRoleValue(override, available, { settings, matchPreferences, modelRegistry })
-		: resolveRoleSelection(["commit", "smol", ...MODEL_ROLE_IDS], settings, available, modelRegistry);
+		: resolveRoleSelection(
+				["commit", "smol", ...MODEL_ROLE_IDS.filter(r => r !== "route")],
+				settings,
+				available,
+				modelRegistry,
+			);
 	const model = resolved?.model;
 	if (!model) {
 		throw new Error("No model available for commit generation");

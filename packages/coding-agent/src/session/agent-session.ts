@@ -106,6 +106,7 @@ import {
 	formatModelString,
 	parseModelString,
 	type ResolvedModelRoleValue,
+	resolveAllowedModels,
 	resolveModelRoleValue,
 } from "../config/model-resolver";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
@@ -816,6 +817,14 @@ export class AgentSession {
 	#autoThinking: boolean = false;
 	/** The level `auto` last resolved to (for UI); undefined until a turn is classified. */
 	#autoResolvedLevel: Effort | undefined;
+	/** True when auto-routing switched to a pro model for the current stretch. */
+	#autoRoutingActive: boolean = false;
+	/** Model saved before auto-routing; used to revert. */
+	#autoRoutingBaseModel: Model | undefined;
+	/** Consecutive ≥High turns; hits 3 → route to pro. Resets on ≤Medium. */
+	#autoRoutingCounter: number = 0;
+	/** Consecutive ≤Medium while routed; hits 2 → downgrade. */
+	#autoRoutingReverseCounter: number = 0;
 	#promptTemplates: PromptTemplate[];
 	#slashCommands: FileSlashCommand[];
 
@@ -5154,6 +5163,7 @@ export class AgentSession {
 		if (!apiKey) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
+		this.#resetAutoRoutingState();
 
 		this.#clearActiveRetryFallback();
 		this.#setModelWithProviderSessionReset(model);
@@ -5177,13 +5187,19 @@ export class AgentSession {
 	 * Validates API key, saves to session log but NOT to settings.
 	 * @throws Error if no API key available for the model
 	 */
-	async setModelTemporary(model: Model, thinkingLevel?: ThinkingLevel): Promise<void> {
+	async setModelTemporary(
+		model: Model,
+		thinkingLevel?: ThinkingLevel,
+		options?: { _suppressAutoRoutingReset?: boolean },
+	): Promise<void> {
 		const previousEditMode = this.#resolveActiveEditMode();
 		const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
 		if (!apiKey) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
-
+		if (!options?._suppressAutoRoutingReset) {
+			this.#resetAutoRoutingState();
+		}
 		this.#clearActiveRetryFallback();
 		this.#setModelWithProviderSessionReset(model);
 		this.sessionManager.appendModelChange(`${model.provider}/${model.id}`, "temporary");
@@ -5206,10 +5222,12 @@ export class AgentSession {
 	 * @returns The new model info, or undefined if only one model available
 	 */
 	async cycleModel(direction: "forward" | "backward" = "forward"): Promise<ModelCycleResult | undefined> {
-		if (this.#scopedModels.length > 0) {
-			return this.#cycleScopedModel(direction);
-		}
-		return this.#cycleAvailableModel(direction);
+		const result =
+			this.#scopedModels.length > 0
+				? await this.#cycleScopedModel(direction)
+				: await this.#cycleAvailableModel(direction);
+		if (result) this.#resetAutoRoutingState();
+		return result;
 	}
 
 	/**
@@ -5468,13 +5486,13 @@ export class AgentSession {
 	 */
 	async #applyAutoThinkingLevel(promptText: string, generation: number): Promise<void> {
 		const model = this.model;
-		if (!model?.reasoning) return;
-
+		if (!model) return;
+		if (!model.reasoning && !this.settings.get("autoRouting")) return;
 		let resolved: Effort | undefined;
+		let classificationSucceeded = false;
 		if (containsUltrathink(promptText)) {
-			// The user explicitly asked for maximum thinking; bypass the classifier
-			// and jump straight to the highest auto-supported level for this model.
 			resolved = clampAutoThinkingEffort(model, Effort.XHigh);
+			classificationSucceeded = true;
 		} else {
 			const controller = new AbortController();
 			const timer = setTimeout(() => controller.abort(), AgentSession.#AUTO_THINKING_TIMEOUT_MS);
@@ -5487,6 +5505,7 @@ export class AgentSession {
 					signal: controller.signal,
 					metadataResolver: provider => this.agent.metadataForProvider(provider),
 				});
+				classificationSucceeded = true;
 			} catch (error) {
 				logger.debug("auto-thinking: classification failed; using fallback level", {
 					error: error instanceof Error ? error.message : String(error),
@@ -5499,21 +5518,100 @@ export class AgentSession {
 		// Drop the result if the turn was aborted/superseded while classifying.
 		if (this.#promptGeneration !== generation || !this.#autoThinking) return;
 
-		const effort = resolved ?? resolveProvisionalAutoLevel(model);
+		let effort = resolved ?? resolveProvisionalAutoLevel(model);
 		if (effort === undefined) return;
-		const shouldPersistResolution = this.#autoResolvedLevel !== effort;
-		this.#autoResolvedLevel = effort;
-		this.#thinkingLevel = effort;
-		this.agent.setThinkingLevel(toReasoningEffort(effort));
-		if (shouldPersistResolution) {
-			this.sessionManager.appendThinkingLevelChange(effort);
+
+		// Auto-routing: switch model based on difficulty (counter-based)
+		if (model && this.settings.get("autoRouting")) {
+			if (this.#autoRoutingActive) {
+				if (classificationSucceeded && (effort === Effort.High || effort === Effort.XHigh)) {
+					this.#autoRoutingReverseCounter = 0;
+				} else if (classificationSucceeded) {
+					this.#autoRoutingReverseCounter++;
+					if (this.#autoRoutingReverseCounter >= 2) {
+						const baseModel = this.#autoRoutingBaseModel;
+						if (baseModel && !modelsAreEqual(baseModel, model)) {
+							try {
+								if (this.#promptGeneration !== generation) return;
+								await this.setModelTemporary(baseModel, undefined, { _suppressAutoRoutingReset: true });
+								if (this.#promptGeneration !== generation) return;
+								this.#autoRoutingActive = false;
+								this.#autoRoutingBaseModel = undefined;
+								this.#autoRoutingCounter = 0;
+								this.#autoRoutingReverseCounter = 0;
+							} catch (err) {
+								// Switch may have succeeded before post-switch refresh failed
+								if (modelsAreEqual(this.model, baseModel)) {
+									this.#autoRoutingActive = false;
+									this.#autoRoutingBaseModel = undefined;
+									this.#autoRoutingCounter = 0;
+									this.#autoRoutingReverseCounter = 0;
+								}
+								logger.debug("auto-routing: downgrade failed", { error: String(err) });
+							}
+						} else {
+							this.#autoRoutingActive = false;
+							this.#autoRoutingBaseModel = undefined;
+							this.#autoRoutingCounter = 0;
+							this.#autoRoutingReverseCounter = 0;
+						}
+					}
+				}
+			} else {
+				// Not routed: short-circuit if no viable target
+				const routeTarget = await this.#resolveAutoRoutingTarget();
+				if (this.#promptGeneration !== generation) return;
+				if (!routeTarget || modelsAreEqual(routeTarget, model)) {
+					this.#autoRoutingCounter = 0;
+				} else if (classificationSucceeded && (effort === Effort.High || effort === Effort.XHigh)) {
+					this.#autoRoutingCounter++;
+					if (this.#autoRoutingCounter >= 3) {
+						const target = await this.#resolveAutoRoutingTarget();
+						if (target && !modelsAreEqual(target, model)) {
+							try {
+								this.#autoRoutingActive = true;
+								this.#autoRoutingBaseModel = model;
+								if (this.#promptGeneration !== generation) {
+									this.#autoRoutingActive = false;
+									this.#autoRoutingBaseModel = undefined;
+									return;
+								}
+								await this.setModelTemporary(target, undefined, { _suppressAutoRoutingReset: true });
+							} catch (err) {
+								if (!modelsAreEqual(this.model, target)) {
+									this.#autoRoutingActive = false;
+									this.#autoRoutingBaseModel = undefined;
+								}
+								logger.debug("auto-routing: upgrade failed", { error: String(err) });
+							}
+						}
+						this.#autoRoutingCounter = 0;
+					}
+				} else if (classificationSucceeded) {
+					this.#autoRoutingCounter = 0;
+				}
+			}
 		}
-		this.#emit({
-			type: "thinking_level_changed",
-			thinkingLevel: effort,
-			configured: AUTO_THINKING,
-			resolved: effort,
-		});
+
+		// Re-clamp effort for the effective model after any routing switch
+		effort = clampAutoThinkingEffort(this.model, effort);
+
+		// Skip thinking level application for non-reasoning models
+		if (this.model?.reasoning) {
+			const shouldPersistResolution = this.#autoResolvedLevel !== effort;
+			this.#autoResolvedLevel = effort;
+			this.#thinkingLevel = effort;
+			this.agent.setThinkingLevel(toReasoningEffort(effort));
+			if (shouldPersistResolution) {
+				this.sessionManager.appendThinkingLevelChange(effort);
+			}
+			this.#emit({
+				type: "thinking_level_changed",
+				thinkingLevel: effort,
+				configured: AUTO_THINKING,
+				resolved: effort,
+			});
+		}
 	}
 
 	/**
@@ -6791,6 +6889,27 @@ export class AgentSession {
 		const thinkingLevel = extractExplicitThinkingSelector(existingRoleValue, this.settings);
 		return formatModelSelectorValue(modelKey, thinkingLevel);
 	}
+	/** Clear all auto-routing runtime state. Called on manual model switch and session restore. */
+	#resetAutoRoutingState(): void {
+		this.#autoRoutingActive = false;
+		this.#autoRoutingBaseModel = undefined;
+		this.#autoRoutingCounter = 0;
+		this.#autoRoutingReverseCounter = 0;
+	}
+
+	/** Resolve the target model for auto-routing — the configured `route` role, filtered through enabledModels. */
+	async #resolveAutoRoutingTarget(): Promise<Model | undefined> {
+		const allowed = await resolveAllowedModels(this.#modelRegistry, this.settings);
+		const routeRole = this.#resolveRoleModelFull("route", allowed, this.model);
+		if (!routeRole.model) return undefined;
+		// Honor --models scope when set
+		if (this.#scopedModels.length > 0) {
+			const scopedIds = new Set(this.#scopedModels.map(s => `${s.model.provider}/${s.model.id}`));
+			if (!scopedIds.has(`${routeRole.model.provider}/${routeRole.model.id}`)) return undefined;
+		}
+		return routeRole.model;
+	}
+
 	#resolveContextPromotionConfiguredTarget(currentModel: Model, availableModels: Model[]): Model | undefined {
 		const configuredTarget = currentModel.contextPromotionTarget?.trim();
 		if (!configuredTarget) return undefined;
@@ -6846,6 +6965,7 @@ export class AgentSession {
 		// as auth fallbacks when the current model has no usable credentials.
 		addCandidate(currentModel);
 		for (const role of MODEL_ROLE_IDS) {
+			if (role === "route") continue;
 			addCandidate(this.#resolveRoleModelFull(role, availableModels, currentModel).model);
 		}
 
@@ -8785,6 +8905,7 @@ export class AgentSession {
 				this.#thinkingLevel = resolveThinkingLevelForModel(this.model, restoredThinkingLevel);
 			}
 			this.agent.setThinkingLevel(toReasoningEffort(this.#thinkingLevel));
+			this.#resetAutoRoutingState();
 			this.agent.serviceTier = hasServiceTierEntry
 				? sessionContext.serviceTier
 				: configuredServiceTier === "none"

@@ -3020,6 +3020,17 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	// Auto routing
+	autoRouting: {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "model",
+			label: "Auto Routing",
+			description: "When auto thinking detects consecutive difficult prompts, route to the Route role model",
+		},
+	},
+
 	"providers.kimiApiFormat": {
 		type: "enum",
 		values: ["openai", "anthropic"] as const,
